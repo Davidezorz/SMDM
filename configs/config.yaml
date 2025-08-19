@@ -18,11 +18,11 @@ subs_masking: False
 seed: 1
 
 loader:
-  global_batch_size: 512
-  eval_global_batch_size: ${.global_batch_size}
+  global_batch_size: 64 # 512
+  eval_global_batch_size: 4 #${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
-  batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  batch_size: 64 # ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  eval_batch_size: 64 # ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
   pin_memory: True
 
@@ -62,10 +62,10 @@ optim:
 
 trainer:
   _target_: lightning.Trainer
-  accelerator: cuda
+  accelerator: cpu #cuda
   num_nodes: 1
-  devices: ${device_count:}
-  accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
+  # devices: ${device_count:}
+  accumulate_grad_batches: 1 # ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
   precision: 'bf16'
   num_sanity_val_steps: 2

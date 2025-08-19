@@ -264,17 +264,16 @@ class Diffusion(L.LightningModule):
     
     # Normalize the logits such that x.exp() is
     # a probability distribution over vocab_size.
-    logits = logits - torch.logsumexp(logits, dim=-1,
-                                      keepdim=True)
+    log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
 
     # Apply updates directly in the logits matrix.
     # For the logits of the unmasked tokens, set all values
     # to -infinity except for the indices corresponding to
     # the unmasked tokens.
     unmasked_indices = (xt != self.mask_index)
-    logits[unmasked_indices] = self.neg_infinity
-    logits[unmasked_indices, xt[unmasked_indices]] = 0
-    return logits
+    log_probs[unmasked_indices] = self.neg_infinity
+    log_probs[unmasked_indices, xt[unmasked_indices]] = 0
+    return log_probs
 
   def _d3pm_parameterization(self, logits):
     if self.subs_masking:
@@ -419,8 +418,7 @@ class Diffusion(L.LightningModule):
          and not self.parameterization == 'ar'):
       # TODO(justin): implement sampling and kv cache for AR
       samples, text_samples = None, None
-      for _ in range(
-        self.config.sampling.num_sample_batches):
+      for _ in range(self.config.sampling.num_sample_batches):
         samples = self._sample()
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
@@ -628,8 +626,7 @@ class Diffusion(L.LightningModule):
     # Technically, this isn't q_xs since there's a division
     # term that is missing. This division term doesn't affect
     # the samples.
-    q_xs = log_p_x0.exp() * (move_chance_t
-                             - move_chance_s)
+    q_xs = log_p_x0.exp() * (move_chance_t - move_chance_s)
     q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
     _x = _sample_categorical(q_xs)
 
@@ -672,21 +669,20 @@ class Diffusion(L.LightningModule):
     p_x0_cache = None
 
     for i in range(num_steps):
-      t = timesteps[i] * torch.ones(
-        x.shape[0], 1, device=self.device)
+      t = timesteps[i] * torch.ones(x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
         x = self._ddpm_update(x, t, dt)
       elif self.sampler == 'ddpm_cache':
         p_x0_cache, x_next = self._ddpm_caching_update(
           x, t, dt, p_x0=p_x0_cache)
-        if (not torch.allclose(x_next, x)
-            or self.time_conditioning):
-          # Disable caching
-          p_x0_cache = None
+        if (not torch.allclose(x_next, x) or self.time_conditioning):
+          p_x0_cache = None  # Disable caching
         x = x_next
       else:
         x = self._analytic_update(x, t, dt)
 
+
+    # last step, remove all noise
     if self.config.sampling.noise_removal:
       t = timesteps[-1] * torch.ones(x.shape[0], 1,
                                      device=self.device)
@@ -694,7 +690,7 @@ class Diffusion(L.LightningModule):
         x = self._denoiser_update(x, t)
       else:
         unet_conditioning = self.noise(t)[0]
-        x = self.forward(x, unet_conditioning).argmax(dim=-1)
+        x = self.forward(x,unet_conditioning).argmax(dim=-1)
     return x
 
   def restore_model_and_sample(self, num_steps, eps=1e-5):
@@ -955,8 +951,7 @@ class Diffusion(L.LightningModule):
     return entropy
 
   @torch.no_grad
-  def sample_subs_guidance(
-    self, n_samples, stride_length, num_strides, dt=0.001):
+  def sample_subs_guidance(self, n_samples, stride_length, num_strides, dt=0.001):
     ones = torch.ones(n_samples, dtype=self.dtype,
                       device=self.device)
 

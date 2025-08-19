@@ -60,6 +60,7 @@ def _print_config(
         config_section, resolve=resolve)
 
     branch.add(rich.syntax.Syntax(branch_content, 'yaml'))
+
   rich.print(tree)
   if save_cfg:
     with fsspec.open(
@@ -160,7 +161,7 @@ def _train(config, logger, tokenizer):
     ckpt_path = config.checkpointing.resume_ckpt_path
   else:
     ckpt_path = None
-
+  
   # Lightning callbacks
   callbacks = []
   if 'callbacks' in config:
@@ -189,8 +190,8 @@ def main(config):
   """Main entry point for training."""
   L.seed_everything(config.seed)
   _print_config(config, resolve=True, save_cfg=True)
-  
   logger = utils.get_logger(__name__)
+
   tokenizer = dataloader.get_tokenizer(config)
 
   if config.mode == 'sample_eval':
@@ -203,3 +204,12 @@ def main(config):
 
 if __name__ == '__main__':
   main()
+
+
+"""
+HYDRA_FULL_ERROR=1 python main.py model=tiny data=openwebtext-split wandb.name=mdlm-owt parameterization=subs model.length=1024 eval.compute_generative_perplexity=True sampling.steps=1000
+
+python main.py model=tiny data=openwebtext-split wandb.name=mdlm-owt parameterization=subs model.length=1024 eval.compute_generative_perplexity=True sampling.steps=1000
+
+4830ea3bcacb2d3d86791ac660ab801a13c9ad6c
+"""

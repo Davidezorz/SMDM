@@ -1,14 +1,18 @@
 import math
 import typing
 
-import flash_attn
-import flash_attn.layers.rotary
+
 import huggingface_hub
 import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+
+if torch.cuda.is_available():
+  import flash_attn
+  import flash_attn.layers.rotary
 
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
@@ -24,6 +28,7 @@ def bias_dropout_add_scale(
     residual: typing.Optional[torch.Tensor],
     prob: float,
     training: bool) -> torch.Tensor:
+
   if bias is not None:
     out = scale * F.dropout(x + bias, p=prob, training=training)
   else:
@@ -110,10 +115,13 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(qkv, cos, sin):
-  cos = cos[0,:,0,0,:cos.shape[-1]//2]
-  sin = sin[0,:,0,0,:sin.shape[-1]//2]
-  return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
-
+  if torch.cuda.is_available():
+    cos = cos[0,:,0,0,:cos.shape[-1]//2]
+    sin = sin[0,:,0,0,:sin.shape[-1]//2]
+    return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
+  else:                                           # cos, sin   -> 1 T 3 1 c   
+    qkv = qkv * cos + rotate_half(qkv) * sin      # qkv  ->   b, s, three, h, d =  
+    return qkv
 
 # function overload
 def modulate(x, shift, scale):
@@ -211,6 +219,7 @@ class LabelEmbedder(nn.Module):
 #################################################################################
 
 
+
 class DDiTBlock(nn.Module):
   def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1):
     super().__init__()
@@ -242,7 +251,8 @@ class DDiTBlock(nn.Module):
 
 
   def forward(self, x, rotary_cos_sin, c, seqlens=None):
-    batch_size, seq_len = x.shape[0], x.shape[1]
+
+    batch_size, seq_len, dim = x.shape[0], x.shape[1], x.shape[2]
 
     bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
@@ -260,19 +270,31 @@ class DDiTBlock(nn.Module):
                     h=self.n_heads)
     with torch.cuda.amp.autocast(enabled=False):
       cos, sin = rotary_cos_sin
-      qkv = apply_rotary_pos_emb(
-        qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
-    qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-    if seqlens is None:
-      cu_seqlens = torch.arange(
-        0, (batch_size + 1) * seq_len, step=seq_len,
-        dtype=torch.int32, device=qkv.device)
+      qkv = apply_rotary_pos_emb(qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+
+    if torch.cuda.is_available():
+      qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+      if seqlens is None:
+        cu_seqlens = torch.arange(
+          0, (batch_size + 1) * seq_len, step=seq_len,
+          dtype=torch.int32, device=qkv.device)
+      else:
+        cu_seqlens = seqlens.cumsum(-1)
+
+      x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
+        qkv, cu_seqlens, seq_len, 0., causal=False)
+      x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
     else:
-      cu_seqlens = seqlens.cumsum(-1)
-    x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-      qkv, cu_seqlens, seq_len, 0., causal=False)
-    
-    x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
+      qkv = rearrange(qkv, 'b s three h d -> b three h s d')
+      q, k, v = qkv.unbind(dim=1)                                  # b three h s d-> 3 * b h s d
+
+      # scaled dot-product attention
+      head_dim = q.shape[-1]
+      attn_scores = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)  # (b h s s)
+      attn_probs = F.softmax(attn_scores, dim=-1)
+
+      x = attn_probs @ v                                            # (b h s d)
+      x = rearrange(x, 'b h s d -> b s (h d)')                      # (b h D)
 
     x = bias_dropout_scale_fn(self.attn_out(x),
                               None,
@@ -307,9 +329,7 @@ class DDitFinalLayer(nn.Module):
     self.linear.weight.data.zero_()
     self.linear.bias.data.zero_()
 
-    self.adaLN_modulation = nn.Linear(cond_dim,
-                                      2 * hidden_size,
-                                      bias=True)
+    self.adaLN_modulation = nn.Linear(cond_dim, 2 * hidden_size)
     self.adaLN_modulation.weight.data.zero_()
     self.adaLN_modulation.bias.data.zero_()
 
@@ -368,3 +388,5 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       x = self.output_layer(x, c)
 
     return x
+  
+  

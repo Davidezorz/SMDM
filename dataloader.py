@@ -302,7 +302,7 @@ def _group_texts(examples, block_size, bos, eos):
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0))*0 + 15, streaming=False):
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
@@ -342,11 +342,14 @@ def get_dataset(
     dataset = get_text8_dataset(
       cache_dir, max_seq_length=block_size, crop_train=True)
   elif dataset_name == 'openwebtext-train':
+    print("I'm here")
+    print(cache_dir)
     dataset = datasets.load_dataset(
       'openwebtext',
       split='train[:-100000]',
       cache_dir=cache_dir,
-      streaming=streaming)
+      streaming=streaming,
+      trust_remote_code=True)
   elif dataset_name == 'openwebtext-valid':
     dataset = datasets.load_dataset(
       'openwebtext',
@@ -393,7 +396,10 @@ def get_dataset(
   elif dataset_name.startswith('scientific_papers'):
     detokenizer = scientific_papers_detokenizer
   else:
+    print('detok')
     detokenizer = None
+
+  
 
   def _apply_detokenizer(detokenizer):
     def detok(text):
@@ -437,6 +443,8 @@ def get_dataset(
                          return_token_type_ids=True)
     return tokens
 
+
+
   if streaming:
     tokenized_dataset = data.map(
       preprocess_and_tokenize,
@@ -449,6 +457,9 @@ def get_dataset(
       num_proc=num_proc,
       load_from_cache_file=True,
       desc='Tokenizing')
+
+  print("tokenization complete")
+    
   if dataset_name == 'ptb':
     tokenized_dataset = tokenized_dataset.remove_columns(
       'sentence')
@@ -486,6 +497,7 @@ def get_dataset(
 
 
 def get_tokenizer(config):
+
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
@@ -520,11 +532,20 @@ def get_tokenizer(config):
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
   return tokenizer
-    
+  
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
-  num_gpus = torch.cuda.device_count()
+  num_gpus =  1#torch.cuda.device_count()
+
+  print(config.loader.global_batch_size)
+  print(config.loader.batch_size)
+  print(config.trainer.num_nodes)
+  print(num_gpus)
+  print(config.trainer.accumulate_grad_batches)
+  print()
+  print(config.loader.global_batch_size)
+  print(config.loader.batch_size * config.trainer.num_nodes * num_gpus * config.trainer.accumulate_grad_batches)
   assert (config.loader.global_batch_size
           == (config.loader.batch_size
               * config.trainer.num_nodes

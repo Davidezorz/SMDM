@@ -1,8 +1,8 @@
 name: tiny
 type: ddit
-hidden_size: 512
-cond_dim: 128
-length: 1024
+hidden_size: 256 # 512
+cond_dim: 64 #128
+length: 512 # 1024
 n_blocks: 8
 n_heads: 8
 scale_by_sigma: True
