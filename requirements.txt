@@ -1,6 +1,6 @@
 # causal-conv1d==1.1.3.post1
 torch
-datasets==2.18.0
+datasets==3.6.0
 einops==0.7.0
 fsspec==2024.2.0
 # git-lfs==1.6
