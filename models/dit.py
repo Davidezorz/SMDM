@@ -21,6 +21,8 @@ torch._C._jit_override_can_fuse_on_cpu(True)
 torch._C._jit_override_can_fuse_on_gpu(True)
 
 
+
+
 def bias_dropout_add_scale(
     x: torch.Tensor,
     bias: typing.Optional[torch.Tensor],
@@ -39,12 +41,27 @@ def bias_dropout_add_scale(
   return out
 
 
-def get_bias_dropout_add_scale(training):
-  def _bias_dropout_add(x, bias, scale, residual, prob):
-    return bias_dropout_add_scale(
-      x, bias, scale, residual, prob, training)
 
-  return _bias_dropout_add
+
+
+@torch.jit.script
+def bias_dropout_add_scale_fused_train(
+    x: torch.Tensor,
+    bias: typing.Optional[torch.Tensor],
+    scale: torch.Tensor,
+    residual: typing.Optional[torch.Tensor],
+    prob: float) -> torch.Tensor:
+  return bias_dropout_add_scale(x, bias, scale, residual, prob, True)
+
+
+@torch.jit.script
+def bias_dropout_add_scale_fused_inference(
+    x: torch.Tensor,
+    bias: typing.Optional[torch.Tensor],
+    scale: torch.Tensor,
+    residual: typing.Optional[torch.Tensor],
+    prob: float) -> torch.Tensor:
+  return bias_dropout_add_scale(x, bias, scale, residual, prob, False)
 
 
 # function overload
@@ -55,28 +72,6 @@ def modulate(x: torch.Tensor,
 
 
 @torch.jit.script
-def bias_dropout_add_scale_fused_train(
-    x: torch.Tensor,
-    bias: typing.Optional[torch.Tensor],
-    scale: torch.Tensor,
-    residual: typing.Optional[torch.Tensor],
-    prob: float) -> torch.Tensor:
-  return bias_dropout_add_scale(
-    x, bias, scale, residual, prob, True)
-
-
-@torch.jit.script
-def bias_dropout_add_scale_fused_inference(
-    x: torch.Tensor,
-    bias: typing.Optional[torch.Tensor],
-    scale: torch.Tensor,
-    residual: typing.Optional[torch.Tensor],
-    prob: float) -> torch.Tensor:
-  return bias_dropout_add_scale(
-    x, bias, scale, residual, prob, False)
-
-
-@torch.jit.script
 def modulate_fused(x: torch.Tensor,
                    shift: torch.Tensor,
                    scale: torch.Tensor) -> torch.Tensor:
@@ -84,27 +79,27 @@ def modulate_fused(x: torch.Tensor,
 
 
 class Rotary(torch.nn.Module):
-  def __init__(self, dim, base=10_000):
+  def __init__(self, C, base=10_000):
     super().__init__()
-    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+    inv_freq = 1.0 / (base ** (torch.arange(0, C, 2).float() / C))
     self.register_buffer('inv_freq', inv_freq)
-    self.seq_len_cached = None
+    self.T_cached = None
     self.cos_cached = None
     self.sin_cached = None
 
   def forward(self, x, seq_dim=1):
-    seq_len = x.shape[seq_dim]
-    if seq_len != self.seq_len_cached:
-      self.seq_len_cached = seq_len
+    T = x.shape[seq_dim]
+    if T != self.T_cached:
+      self.T_cached = T
       t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
       freqs = torch.einsum("i,j->ij", t, self.inv_freq.clone())
       emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-      # dims are: batch, seq_len, qkv, head, dim
+      # dims are: B, T, 3 (qkv), H, c
       self.cos_cached = emb.cos()[None, :, None, None, :].repeat(1,1,3,1,1)
       self.sin_cached = emb.sin()[None, :, None, None, :].repeat(1,1,3,1,1)
-      # This makes the transformation on v an identity.
-      self.cos_cached[:,:,2,:,:].fill_(1.)
-      self.sin_cached[:,:,2,:,:].fill_(0.)
+      
+      self.cos_cached[:,:,2,:,:].fill_(1.)  # This makes the transformation 
+      self.sin_cached[:,:,2,:,:].fill_(0.)  # on v an identity
 
     return self.cos_cached, self.sin_cached
 
@@ -131,34 +126,56 @@ def modulate(x, shift, scale):
 #################################################################################
 #                                  Layers                                       #
 #################################################################################
+
 class LayerNorm(nn.Module):
   def __init__(self, dim):
     super().__init__()
     self.weight = nn.Parameter(torch.ones([dim]))
     self.dim = dim
   def forward(self, x):
+    print(x.shape)
+    
     with torch.cuda.amp.autocast(enabled=False):
       x = F.layer_norm(x.float(), [self.dim])
     return x * self.weight[None,None,:]
 
 
-def residual_linear(x, W, x_skip, residual_scale):
-  """x_skip + residual_scale * W @ x"""
-  dim_out, dim_in = W.shape[0], W.shape[1]
-  return torch.addmm(
-    x_skip.view(-1, dim_out),
-    x.view(-1, dim_in),
-    W.T,
-    alpha=residual_scale).view(*x.shape[:-1], dim_out)
 
 
 #################################################################################
-#               Embedding Layers for Timesteps and Class Labels                 #
+#                        Embedding Layers for Timesteps                         #
 #################################################################################
+
+
 class TimestepEmbedder(nn.Module):
-  """
-  Embeds scalar timesteps into vector representations.
-  """
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256, max_period = 10_000):
+        super().__init__()
+        self.mlp = nn.Sequential(
+        nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+        nn.SiLU(),
+        nn.Linear(hidden_size, hidden_size, bias=True))
+
+        self.f_dim = frequency_embedding_size
+
+        half = self.f_dim // 2
+        arange = torch.arange(0, half, dtype=torch.get_default_dtype())       # f_dim//2
+        freqs = torch.exp(- math.log(max_period)* arange / half )             # f_dim//2
+        self.register_buffer('freqs', freqs)  
+
+    def forward(self, t):
+        args = t[:, None].float() * self.freqs[None]                          # B f_dim//2
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)     # B (f_dim//2)*2 != B f_dim if f_dim is odd
+        embedding = F.pad(embedding, (0, self.f_dim % 2))                     # B f_dim
+
+        return self.mlp(embedding)                                            # B hidden_size
+
+
+"""
+class TimestepEmbedder(nn.Module):
+
   def __init__(self, hidden_size, frequency_embedding_size=256):
     super().__init__()
     self.mlp = nn.Sequential(
@@ -168,51 +185,27 @@ class TimestepEmbedder(nn.Module):
     self.frequency_embedding_size = frequency_embedding_size
 
   @staticmethod
-  def timestep_embedding(t, dim, max_period=10000):
-    """
-    Create sinusoidal timestep embeddings.
-    :param t: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an (N, D) Tensor of positional embeddings.
-    """
-    # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-    half = dim // 2
-    freqs = torch.exp(
-      - math.log(max_period)
-      * torch.arange(start=0, end=half, dtype=torch.float32)
-      / half).to(device=t.device)
+  def timestep_embedding(t, C, max_period=10000):
+    half = C // 2
+    freqs = torch.exp(- math.log(max_period)
+      * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(device=t.device)
     args = t[:, None].float() * freqs[None]
+
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-      embedding = torch.cat(
-        [embedding,
+    if C % 2:
+      embedding = torch.cat([embedding,
          torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
 
   def forward(self, t):
+    
     t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
     t_emb = self.mlp(t_freq)
     return t_emb
-
-
-class LabelEmbedder(nn.Module):
-  """Embeds class labels into vector representations.
+"""
   
-  Also handles label dropout for classifier-free guidance.
-  """
-  def __init__(self, num_classes, cond_size):
-    super().__init__()
-    self.embedding_table = nn.Embedding(num_classes + 1, cond_size)
-    self.num_classes = num_classes
 
-    # TODO think of initializing with 0.02 std deviation like in original DiT paper
 
-  def forward(self, labels):
-    embeddings = self.embedding_table(labels)
-    return embeddings
-    
 
 #################################################################################
 #                                 Core Model                                    #
@@ -295,6 +288,7 @@ class DDiTBlock(nn.Module):
 
       x = attn_probs @ v                                            # (b h s d)
       x = rearrange(x, 'b h s d -> b s (h d)')                      # (b h D)
+
 
     x = bias_dropout_scale_fn(self.attn_out(x),
                               None,
